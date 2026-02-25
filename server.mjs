@@ -68,6 +68,7 @@ const EXCHANGES = {
   },
 };
 
+const DEFAULT_DISABLED_EXCHANGES = new Set(['bybit']);
 const SUPPORTED_COINS = new Set(['BTC', 'ETH', 'SOL', 'BNB']);
 const TAKER_FEE_BPS = {
   binance: 5,
@@ -1446,10 +1447,19 @@ function resolveContentType(pathname) {
   return 'text/plain; charset=utf-8';
 }
 
+function parseBoolParam(value, defaultValue = false) {
+  if (value == null || value === '') return defaultValue;
+  const s = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on'].includes(s)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(s)) return false;
+  return defaultValue;
+}
+
 async function handleSlippage(req, res, url) {
   const coin = String(url.searchParams.get('coin') || 'BTC').toUpperCase();
   const qty = Number(url.searchParams.get('qty') || '1');
   const side = String(url.searchParams.get('side') || 'buy').toLowerCase();
+  const includeBybit = parseBoolParam(url.searchParams.get('include_bybit'), false);
 
   if (!SUPPORTED_COINS.has(coin)) {
     return json(res, 400, { error: 'coin must be one of BTC, ETH, SOL, BNB' });
@@ -1463,7 +1473,12 @@ async function handleSlippage(req, res, url) {
     return json(res, 400, { error: 'side must be buy or sell' });
   }
 
-  const tasks = Object.entries(EXCHANGES).map(async ([id, conf]) => {
+  const exchangeEntries = Object.entries(EXCHANGES).filter(([id]) => {
+    if (!includeBybit && DEFAULT_DISABLED_EXCHANGES.has(id)) return false;
+    return true;
+  });
+
+  const tasks = exchangeEntries.map(async ([id, conf]) => {
     try {
       const result = await conf.adapter(coin, qty, side);
       const simulation =
