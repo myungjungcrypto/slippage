@@ -1,0 +1,136 @@
+:root {
+  --bg: #f7f4ed;
+  --ink: #17130f;
+  --paper: #fffdf8;
+  --line: #d8cdb9;
+  --ok: #1b9f62;
+  --err: #bf2d3a;
+  --accent: #dd6a20;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: radial-gradient(circle at top right, #ffe7ce 0, var(--bg) 40%);
+  font-family: "IBM Plex Sans KR", "Noto Sans KR", sans-serif;
+}
+
+.wrap {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(1.4rem, 2.8vw, 2.3rem);
+}
+
+.hero p {
+  margin-top: 8px;
+  color: #5f5142;
+}
+
+.controls {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.92rem;
+}
+
+select,
+input,
+button {
+  border: 1px solid var(--line);
+  background: var(--paper);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: var(--ink);
+  font-size: 0.95rem;
+}
+
+button {
+  background: linear-gradient(140deg, #e9782f 0%, var(--accent) 100%);
+  border: none;
+  color: white;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.92rem;
+  margin: 16px 2px 8px;
+  color: #5f5142;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 960px;
+}
+
+th,
+td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #efe5d3;
+  text-align: right;
+  font-size: 0.88rem;
+}
+
+th:first-child,
+td:first-child,
+th:nth-child(2),
+td:nth-child(2),
+th:last-child,
+td:last-child {
+  text-align: left;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 650;
+  font-size: 0.75rem;
+}
+
+.badge.ok {
+  background: #e1f6ec;
+  color: var(--ok);
+}
+
+.badge.error {
+  background: #fbe5e7;
+  color: var(--err);
+}
+
+.partial {
+  color: #855200;
+  font-weight: 600;
+}

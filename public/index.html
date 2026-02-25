@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>실시간 슬리피지 대시보드</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="hero">
+        <h1>실시간 마켓 체결 슬리피지</h1>
+        <p>거래소별 오더북 기준으로 즉시 시장가 체결 시 예상 슬리피지를 계산합니다.</p>
+      </header>
+
+      <section class="controls">
+        <label>
+          코인
+          <select id="coin">
+            <option value="BTC">BTC</option>
+            <option value="ETH">ETH</option>
+            <option value="SOL">SOL</option>
+            <option value="BNB">BNB</option>
+          </select>
+        </label>
+
+        <label>
+          수량
+          <input id="qty" type="number" min="0.0001" step="0.0001" value="1" />
+        </label>
+
+        <label>
+          방향
+          <select id="side">
+            <option value="buy">매수 (Buy Market)</option>
+            <option value="sell">매도 (Sell Market)</option>
+          </select>
+        </label>
+
+        <label>
+          갱신 간격
+          <select id="interval">
+            <option value="off">OFF (자동갱신 끔)</option>
+            <option value="2000">2초</option>
+            <option value="3000" selected>3초</option>
+            <option value="5000">5초</option>
+            <option value="10000">10초</option>
+          </select>
+        </label>
+
+        <button id="refresh">지금 갱신</button>
+      </section>
+
+      <section class="meta">
+        <span id="status">초기화 중...</span>
+        <span id="updatedAt"></span>
+      </section>
+
+      <section class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>거래소</th>
+              <th>상태</th>
+              <th>All-in Cost (bps)</th>
+              <th>All-in Cost (%)</th>
+              <th>Fee (bps)</th>
+              <th>Fee (Quote)</th>
+              <th>총비용(슬리피지+수수료)</th>
+              <th>Top Price</th>
+              <th>Avg Fill Price</th>
+              <th>Slippage (bps)</th>
+              <th>Slippage (%)</th>
+              <th>체결수량</th>
+              <th>체결노셔널(USDT/USD)</th>
+              <th>오류</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
