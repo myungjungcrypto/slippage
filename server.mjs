@@ -1420,8 +1420,11 @@ async function fetchVariationalBook(coin, qty, side) {
   }
 
   let topPrice = topFromQuotes ?? quotePrice;
-  if (usedSpreadFallback || usedStaleTopFallback) {
-    // If we already switched to spread fallback, do not derive slippage from stale quote buckets.
+  if (usedSpreadFallback) {
+    // In spread fallback mode, estimate slippage versus mark (mid proxy), not stale bucket top.
+    topPrice = markPrice > 0 ? markPrice : quotePrice;
+  } else if (usedStaleTopFallback) {
+    // Top fallback has no reliable depth curve; keep neutral.
     topPrice = quotePrice;
   }
   // Enforce market-order invariants to avoid negative slippage from stale/misaligned quote buckets.
