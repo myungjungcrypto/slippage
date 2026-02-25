@@ -1305,39 +1305,46 @@ async function fetchLighterBook(coin) {
   });
 }
 
+function parseVariationalBucketSize_(key) {
+  const s = String(key || '').trim().toLowerCase().replace(/_/g, '');
+  if (!s || s === 'updatedat') return null;
+  const m = s.match(/^(?:size|notional)?(\d+(?:\.\d+)?)([km]?)$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const suf = String(m[2] || '').toLowerCase();
+  const mul = suf === 'k' ? 1_000 : suf === 'm' ? 1_000_000 : 1;
+  return n * mul;
+}
+
+function getVariationalQuotePoints_(quotes, side) {
+  if (!quotes || typeof quotes !== 'object') return [];
+  const pointsBySize = new Map();
+
+  for (const [k, v] of Object.entries(quotes)) {
+    if (!v || typeof v !== 'object') continue;
+    const size = parseVariationalBucketSize_(k);
+    if (!(size > 0)) continue;
+    const price = toNum(v?.[side] ?? v?.[String(side).toUpperCase()]);
+    if (!(price > 0)) continue;
+    if (!pointsBySize.has(size)) pointsBySize.set(size, price);
+  }
+
+  return Array.from(pointsBySize.entries())
+    .map(([size, price]) => ({ size, price }))
+    .sort((a, b) => a.size - b.size);
+}
+
 function pickVariationalQuotePrice(quotes, notional, side) {
-  if (!quotes || typeof quotes !== 'object') {
-    return null;
-  }
-  const resolveSidePrice = (entry) => toNum(entry?.[side] ?? entry?.[side.toUpperCase()]);
-  const resolveBucket = (bucketKeys) => {
-    for (const key of bucketKeys) {
-      if (quotes[key]) {
-        const price = resolveSidePrice(quotes[key]);
-        if (price) return price;
-      }
-    }
-    return null;
-  };
+  const points = getVariationalQuotePoints_(quotes, side);
+  if (!points.length) return null;
 
-  const points = [
-    { size: 1_000, keys: ['size_1k', '1k', 'notional_1k'] },
-    { size: 100_000, keys: ['size_100k', '100k', 'notional_100k'] },
-    { size: 1_000_000, keys: ['size_1m', '1m', 'notional_1m'] },
-  ]
-    .map((point) => {
-      const price = resolveBucket(point.keys);
-      return price ? { size: point.size, price } : null;
-    })
-    .filter(Boolean);
+  const smallest = points[0];
+  const largest = points[points.length - 1];
 
-  if (!points.length) {
-    return null;
-  }
-  points.sort((a, b) => a.size - b.size);
-
-  if (notional <= points[0].size) return points[0].price;
-  if (notional >= points[points.length - 1].size) return points[points.length - 1].price;
+  if (!(notional > 0) || notional <= smallest.size) return smallest.price;
+  if (notional <= smallest.size * 10) return smallest.price; // small tickets: use top bucket directly
+  if (notional >= largest.size) return largest.price;
 
   for (let i = 0; i < points.length - 1; i += 1) {
     const left = points[i];
@@ -1348,18 +1355,12 @@ function pickVariationalQuotePrice(quotes, notional, side) {
     }
   }
 
-  return points[points.length - 1].price;
+  return largest.price;
 }
 
 function pickVariationalTopPrice(quotes, side) {
-  if (!quotes || typeof quotes !== 'object') return null;
-  const keys = ['size_1k', '1k', 'notional_1k', 'size_100k', '100k', 'notional_100k'];
-  for (const key of keys) {
-    const entry = quotes[key];
-    const price = toNum(entry?.[side] ?? entry?.[side.toUpperCase()]);
-    if (price && price > 0) return price;
-  }
-  return null;
+  const points = getVariationalQuotePoints_(quotes, side);
+  return points.length ? points[0].price : null;
 }
 
 function estimateFromBaseSpread(markPrice, baseSpreadBps, side) {
@@ -1394,12 +1395,14 @@ async function fetchVariationalBook(coin, qty, side) {
   const isQuoteStale = quoteAgeSec > 60;
   const notional = qty * markPrice;
   const quoteSide = side === 'buy' ? 'ask' : 'bid';
+  let usedSpreadFallback = false;
   let quotePrice = pickVariationalQuotePrice(listing?.quotes, notional, quoteSide);
   if (!quotePrice || isQuoteStale) {
     const spreadBps = toNum(listing?.base_spread_bps);
     const spreadBasedPrice = estimateFromBaseSpread(markPrice, spreadBps, side);
     if (spreadBasedPrice) {
       quotePrice = spreadBasedPrice;
+      usedSpreadFallback = true;
     }
   }
   if (!quotePrice || quotePrice <= 0) {
@@ -1407,6 +1410,10 @@ async function fetchVariationalBook(coin, qty, side) {
   }
 
   let topPrice = pickVariationalTopPrice(listing?.quotes, quoteSide) ?? quotePrice;
+  if (usedSpreadFallback) {
+    // If we already switched to spread fallback, do not derive slippage from stale quote buckets.
+    topPrice = quotePrice;
+  }
   // Enforce market-order invariants to avoid negative slippage from stale/misaligned quote buckets.
   if (side === 'buy' && quotePrice < topPrice) {
     topPrice = quotePrice;
