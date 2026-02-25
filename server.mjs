@@ -7,6 +7,13 @@ const PORT = process.env.PORT || 8787;
 const PUBLIC_DIR = join(process.cwd(), 'public');
 const CACHE_TTL_MS = 1500;
 
+const O1_BASE = 'https://zo-mainnet.n1.xyz';
+const NADO_GATEWAY = 'https://gateway.prod.nado.xyz/v1';
+const PACIFICA_BASE = process.env.PACIFICA_BASE_URL || 'https://api.pacifica.fi';
+const PARADEX_BASE = process.env.PARADEX_BASE_URL || 'https://api.prod.paradex.trade';
+const EXTENDED_BASE = process.env.EXTENDED_BASE_URL || 'https://api.starknet.extended.exchange';
+const EXTENDED_FALLBACK_BASES = ['https://api.extended.exchange'];
+
 const cache = new Map();
 
 const EXCHANGES = {
@@ -38,6 +45,26 @@ const EXCHANGES = {
     name: 'Variational',
     adapter: fetchVariationalBook,
   },
+  '01xyz': {
+    name: '01xyz',
+    adapter: fetch01xyzBook,
+  },
+  nado: {
+    name: 'Nado',
+    adapter: fetchNadoBook,
+  },
+  pacifica: {
+    name: 'Pacifica',
+    adapter: fetchPacificaBook,
+  },
+  paradex: {
+    name: 'Paradex',
+    adapter: fetchParadexBook,
+  },
+  extended: {
+    name: 'Extended',
+    adapter: fetchExtendedBook,
+  },
 };
 
 const SUPPORTED_COINS = new Set(['BTC', 'ETH', 'SOL', 'BNB']);
@@ -49,6 +76,11 @@ const TAKER_FEE_BPS = {
   okx: 5,
   lighter: 0,
   variational: 0,
+  '01xyz': 5,
+  nado: 5,
+  pacifica: 5,
+  paradex: 5,
+  extended: 5,
 };
 
 // Fallback market ids observed in production funding feed.
@@ -82,6 +114,115 @@ function normalizeLevels(rawLevels) {
       return { price: null, size: null };
     })
     .filter((l) => l.price && l.size && l.price > 0 && l.size > 0);
+}
+
+function extractBaseSymbol(raw) {
+  const s = String(raw || '').toUpperCase();
+  if (!s) return '';
+  for (const base of SUPPORTED_COINS) {
+    if (s === base) return base;
+    if (s.startsWith(`${base}-`)) return base;
+    if (s.startsWith(`${base}/`)) return base;
+    if (s.startsWith(`${base}_`)) return base;
+    if (s.startsWith(base) && /PERP|USD|USDT|USDC/.test(s)) return base;
+  }
+  return '';
+}
+
+function pickFrom(obj, keys = []) {
+  for (const key of keys) {
+    if (obj && obj[key] != null) return obj[key];
+  }
+  return null;
+}
+
+function extractBookFromPayload(payload) {
+  const roots = [
+    payload,
+    payload?.data,
+    payload?.result,
+    payload?.book,
+    payload?.orderbook,
+    payload?.orderBook,
+    payload?.depth,
+    payload?.marketDepth,
+  ];
+
+  for (const root of roots) {
+    if (!root || typeof root !== 'object') continue;
+
+    const asksRaw = root.asks ?? root.a ?? root.sell_orders ?? root.sellOrders;
+    const bidsRaw = root.bids ?? root.b ?? root.buy_orders ?? root.buyOrders;
+    const asks = normalizeLevels(asksRaw || []);
+    const bids = normalizeLevels(bidsRaw || []);
+    if (asks.length && bids.length) {
+      return { asks, bids };
+    }
+  }
+
+  return { asks: [], bids: [] };
+}
+
+function buildSyntheticSimulation({ qty, side, markPrice, bestBid, bestAsk }) {
+  const qtyNum = Number(qty);
+  if (!(qtyNum > 0)) throw new Error('qty must be positive');
+
+  const mark = toNum(markPrice);
+  const bid = toNum(bestBid);
+  const ask = toNum(bestAsk);
+
+  let topPrice = null;
+  if (side === 'buy') topPrice = ask ?? mark;
+  else topPrice = bid ?? mark;
+
+  if (!(topPrice > 0)) throw new Error('top price unavailable');
+
+  const avgExecutionPrice = topPrice;
+  const notionalQuote = avgExecutionPrice * qtyNum;
+
+  return {
+    topPrice,
+    avgExecutionPrice,
+    requestedQty: qtyNum,
+    filledQty: qtyNum,
+    fillRatio: 1,
+    slippagePct: 0,
+    slippageBps: 0,
+    notionalQuote,
+    isPartial: false,
+  };
+}
+
+function cacheQtyKey(qty) {
+  const n = Number(qty);
+  if (!Number.isFinite(n)) return '0';
+  return (Math.round(n * 1e6) / 1e6).toString();
+}
+
+async function fetchReferenceMark(coin) {
+  const sym = String(coin || '').toUpperCase();
+  if (!SUPPORTED_COINS.has(sym)) return null;
+
+  return fetchWithCache(`refmark:${sym}`, async () => {
+    // 1) Hyperliquid allMids
+    try {
+      const mids = await getJson('https://api.hyperliquid.xyz/info', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'allMids' }),
+      });
+      const m = toNum(mids?.[sym] ?? mids?.mids?.[sym]);
+      if (m && m > 0) return m;
+    } catch (_) {}
+
+    // 2) Coinbase spot ticker fallback
+    try {
+      const t = await getJson(`https://api.exchange.coinbase.com/products/${sym}-USD/ticker`);
+      const p = toNum(t?.price ?? t?.last);
+      if (p && p > 0) return p;
+    } catch (_) {}
+
+    return null;
+  });
 }
 
 function simulateMarketOrder({ asks, bids, qty, side }) {
@@ -258,6 +399,267 @@ async function fetchOkxBook(coin) {
       asks: normalizeLevels(book.asks),
       bids: normalizeLevels(book.bids),
     };
+  });
+}
+
+async function fetch01xyzBook(coin, qty, side) {
+  const base = String(coin || '').toUpperCase();
+  return fetchWithCache(`01xyz:${base}:${side}:${cacheQtyKey(qty)}`, async () => {
+    const info = await getJson(`${O1_BASE}/info`);
+    const markets = Array.isArray(info?.markets) ? info.markets : [];
+    if (!markets.length) throw new Error('01xyz markets empty');
+
+    const candidates = [];
+    for (const m of markets) {
+      const marketId = toNum(m?.market_id ?? m?.marketId ?? m?.id);
+      if (marketId == null) continue;
+      const symbol = String(m?.symbol || '').toUpperCase();
+      if (!symbol.includes(base)) continue;
+      const score =
+        symbol === `${base}USD` ? 4 :
+        symbol === `${base}-USD` ? 3 :
+        symbol.startsWith(base) && symbol.endsWith('USD') ? 2 :
+        symbol.startsWith(base) ? 1 : 0;
+      if (score <= 0) continue;
+      candidates.push({ marketId, symbol, score });
+    }
+    candidates.sort((a, b) => (b.score - a.score) || (a.marketId - b.marketId));
+    if (!candidates.length) throw new Error(`01xyz market not found for ${base}`);
+
+    let lastErr = null;
+    for (const c of candidates.slice(0, 8)) {
+      const marketId = c.marketId;
+
+      const bookUrls = [
+        `${O1_BASE}/market/${marketId}/orderbook`,
+        `${O1_BASE}/market/${marketId}/book`,
+        `${O1_BASE}/market/${marketId}/depth`,
+      ];
+      for (const url of bookUrls) {
+        try {
+          const payload = await getJson(url);
+          const book = extractBookFromPayload(payload);
+          if (book.asks.length && book.bids.length) return book;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      try {
+        const st = await getJson(`${O1_BASE}/market/${marketId}/stats`);
+        const perp = st?.perpStats ?? st?.perp_stats ?? {};
+        const mark =
+          toNum(st?.mark_price) ??
+          toNum(st?.markPrice) ??
+          toNum(perp?.mark_price) ??
+          toNum(perp?.markPrice) ??
+          await fetchReferenceMark(base);
+        const bid =
+          toNum(st?.best_bid) ??
+          toNum(st?.bestBid) ??
+          toNum(st?.bid_price) ??
+          toNum(st?.bidPrice) ??
+          toNum(perp?.best_bid) ??
+          toNum(perp?.bestBid);
+        const ask =
+          toNum(st?.best_ask) ??
+          toNum(st?.bestAsk) ??
+          toNum(st?.ask_price) ??
+          toNum(st?.askPrice) ??
+          toNum(perp?.best_ask) ??
+          toNum(perp?.bestAsk);
+        const simulation = buildSyntheticSimulation({ qty, side, markPrice: mark, bestBid: bid, bestAsk: ask });
+        return { kind: 'simulation', simulation };
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw new Error(`01xyz book unavailable: ${lastErr instanceof Error ? lastErr.message : 'unknown error'}`);
+  });
+}
+
+async function fetchNadoBook(coin, qty, side) {
+  const base = String(coin || '').toUpperCase();
+  return fetchWithCache(`nado:${base}:${side}:${cacheQtyKey(qty)}`, async () => {
+    const symbolsRes = await getJson(`${NADO_GATEWAY}/symbols`);
+    const symbolsList = Array.isArray(symbolsRes)
+      ? symbolsRes
+      : Array.isArray(symbolsRes?.data)
+        ? symbolsRes.data
+        : Object.values(symbolsRes?.data?.symbols || symbolsRes?.symbols || {});
+
+    if (!Array.isArray(symbolsList) || !symbolsList.length) throw new Error('nado symbols empty');
+
+    const wanted = `${base}-PERP`;
+    const picked = symbolsList.find((it) => String(it?.symbol || '').toUpperCase() === wanted);
+    if (!picked) throw new Error(`nado symbol not found: ${wanted}`);
+
+    const productId = toNum(picked?.product_id ?? picked?.productId);
+    const symbol = wanted;
+
+    const bookUrls = [
+      `${NADO_GATEWAY}/orderbook?symbol=${encodeURIComponent(symbol)}`,
+      `${NADO_GATEWAY}/orderbook?symbol_key=${encodeURIComponent(symbol)}`,
+      productId != null ? `${NADO_GATEWAY}/orderbook?product_id=${encodeURIComponent(productId)}` : '',
+      `${NADO_GATEWAY}/depth?symbol=${encodeURIComponent(symbol)}`,
+      productId != null ? `${NADO_GATEWAY}/depth?product_id=${encodeURIComponent(productId)}` : '',
+      `${NADO_GATEWAY}/book?symbol=${encodeURIComponent(symbol)}`,
+    ].filter(Boolean);
+
+    let lastErr = null;
+    for (const url of bookUrls) {
+      try {
+        const payload = await getJson(url);
+        const book = extractBookFromPayload(payload);
+        if (book.asks.length && book.bids.length) return book;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    const mark =
+      toNum(picked?.mark_price) ??
+      toNum(picked?.markPrice) ??
+      toNum(picked?.index_price) ??
+      toNum(picked?.indexPrice) ??
+      toNum(picked?.last_price) ??
+      toNum(picked?.lastPrice) ??
+      await fetchReferenceMark(base);
+    const bid = toNum(picked?.best_bid) ?? toNum(picked?.bestBid) ?? toNum(picked?.bid_price) ?? toNum(picked?.bidPrice);
+    const ask = toNum(picked?.best_ask) ?? toNum(picked?.bestAsk) ?? toNum(picked?.ask_price) ?? toNum(picked?.askPrice);
+    if (!(mark > 0) && !(bid > 0) && !(ask > 0)) {
+      throw new Error(`nado book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}`);
+    }
+    return { kind: 'simulation', simulation: buildSyntheticSimulation({ qty, side, markPrice: mark, bestBid: bid, bestAsk: ask }) };
+  });
+}
+
+async function fetchPacificaBook(coin, qty, side) {
+  const base = String(coin || '').toUpperCase();
+  return fetchWithCache(`pacifica:${base}:${side}:${cacheQtyKey(qty)}`, async () => {
+    const symbols = [`${base}-USD`, `${base}USD`, `${base}/USD`, base];
+    const bookUrls = [];
+    for (const s of symbols) {
+      bookUrls.push(`${PACIFICA_BASE}/api/v1/info/orderbook?symbol=${encodeURIComponent(s)}`);
+      bookUrls.push(`${PACIFICA_BASE}/api/v1/info/books?symbol=${encodeURIComponent(s)}`);
+      bookUrls.push(`${PACIFICA_BASE}/api/v1/info/markets/${encodeURIComponent(s)}/orderbook`);
+      bookUrls.push(`${PACIFICA_BASE}/api/v1/info/markets/${encodeURIComponent(s)}/book`);
+    }
+
+    let lastErr = null;
+    for (const url of Array.from(new Set(bookUrls))) {
+      try {
+        const payload = await getJson(url);
+        const book = extractBookFromPayload(payload);
+        if (book.asks.length && book.bids.length) return book;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    const prices = await getJson(`${PACIFICA_BASE}/api/v1/info/prices`, { headers: { Accept: 'application/json' } });
+    const items = Array.isArray(prices) ? prices : Array.isArray(prices?.data) ? prices.data : [];
+    const it = items.find((x) => extractBaseSymbol(x?.symbol) === base);
+    const mark = toNum(it?.mark) ?? toNum(it?.mark_price) ?? await fetchReferenceMark(base);
+    const bid = toNum(it?.best_bid) ?? toNum(it?.bestBid) ?? toNum(it?.bid_price) ?? toNum(it?.bidPrice);
+    const ask = toNum(it?.best_ask) ?? toNum(it?.bestAsk) ?? toNum(it?.ask_price) ?? toNum(it?.askPrice);
+    if (!(mark > 0) && !(bid > 0) && !(ask > 0)) {
+      throw new Error(`pacifica book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}`);
+    }
+    return { kind: 'simulation', simulation: buildSyntheticSimulation({ qty, side, markPrice: mark, bestBid: bid, bestAsk: ask }) };
+  });
+}
+
+async function fetchParadexBook(coin, qty, side) {
+  const base = String(coin || '').toUpperCase();
+  return fetchWithCache(`paradex:${base}:${side}:${cacheQtyKey(qty)}`, async () => {
+    const markets = [`${base}-USD-PERP`, `${base}-USD`, `${base}-PERP`];
+    const bookUrls = [];
+    for (const m of markets) {
+      bookUrls.push(`${PARADEX_BASE}/v1/orderbook/${encodeURIComponent(m)}`);
+      bookUrls.push(`${PARADEX_BASE}/v1/orderbook?market=${encodeURIComponent(m)}`);
+      bookUrls.push(`${PARADEX_BASE}/v1/markets/${encodeURIComponent(m)}/orderbook`);
+    }
+
+    let lastErr = null;
+    for (const url of Array.from(new Set(bookUrls))) {
+      try {
+        const payload = await getJson(url, { headers: { Accept: 'application/json' } });
+        const book = extractBookFromPayload(payload);
+        if (book.asks.length && book.bids.length) return book;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    const summary = await getJson(`${PARADEX_BASE}/v1/markets/summary?market=ALL`, { headers: { Accept: 'application/json' } });
+    const items = Array.isArray(summary?.results) ? summary.results : Array.isArray(summary) ? summary : [];
+    const it =
+      items.find((x) => String(x?.symbol || '').toUpperCase() === `${base}-USD-PERP`) ||
+      items.find((x) => String(x?.symbol || '').toUpperCase().startsWith(`${base}-`) && String(x?.symbol || '').toUpperCase().includes('PERP'));
+
+    const mark = toNum(it?.mark_price) ?? toNum(it?.markPrice) ?? await fetchReferenceMark(base);
+    const bid = toNum(it?.best_bid) ?? toNum(it?.bestBid) ?? toNum(it?.bid_price) ?? toNum(it?.bidPrice);
+    const ask = toNum(it?.best_ask) ?? toNum(it?.bestAsk) ?? toNum(it?.ask_price) ?? toNum(it?.askPrice);
+    if (!(mark > 0) && !(bid > 0) && !(ask > 0)) {
+      throw new Error(`paradex book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}`);
+    }
+    return { kind: 'simulation', simulation: buildSyntheticSimulation({ qty, side, markPrice: mark, bestBid: bid, bestAsk: ask }) };
+  });
+}
+
+async function fetchExtendedBook(coin, qty, side) {
+  const base = String(coin || '').toUpperCase();
+  return fetchWithCache(`extended:${base}:${side}:${cacheQtyKey(qty)}`, async () => {
+    const bases = [EXTENDED_BASE, ...EXTENDED_FALLBACK_BASES.filter((b) => b !== EXTENDED_BASE)];
+    let lastErr = null;
+
+    for (const baseUrl of bases) {
+      const marketCandidates = [`${base}-USD`, `${base}-USD-PERP`, `${base}-PERP`];
+
+      for (const market of marketCandidates) {
+        const orderUrls = [
+          `${baseUrl}/api/v1/info/markets/${encodeURIComponent(market)}/orderbook`,
+          `${baseUrl}/api/v1/info/markets/${encodeURIComponent(market)}/book`,
+          `${baseUrl}/api/v1/info/markets/${encodeURIComponent(market)}/depth`,
+        ];
+        for (const url of orderUrls) {
+          try {
+            const payload = await getJson(url, { headers: { Accept: 'application/json' } });
+            const book = extractBookFromPayload(payload);
+            if (book.asks.length && book.bids.length) return book;
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+
+        try {
+          const st = await getJson(
+            `${baseUrl}/api/v1/info/markets/${encodeURIComponent(market)}/stats`,
+            { headers: { Accept: 'application/json' } },
+          );
+          const p = st?.data ?? st?.marketStats ?? st;
+          const mark =
+            toNum(p?.markPrice) ??
+            toNum(p?.mark_price) ??
+            toNum(p?.oraclePrice) ??
+            toNum(p?.oracle_price) ??
+            toNum(p?.indexPrice) ??
+            toNum(p?.index_price) ??
+            await fetchReferenceMark(base);
+          const bid = toNum(p?.best_bid) ?? toNum(p?.bestBid) ?? toNum(p?.bid_price) ?? toNum(p?.bidPrice);
+          const ask = toNum(p?.best_ask) ?? toNum(p?.bestAsk) ?? toNum(p?.ask_price) ?? toNum(p?.askPrice);
+          if (mark > 0 || bid > 0 || ask > 0) {
+            return { kind: 'simulation', simulation: buildSyntheticSimulation({ qty, side, markPrice: mark, bestBid: bid, bestAsk: ask }) };
+          }
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+    }
+
+    throw new Error(`extended book unavailable: ${lastErr instanceof Error ? lastErr.message : 'unknown error'}`);
   });
 }
 
