@@ -51,6 +51,14 @@ const TAKER_FEE_BPS = {
   variational: 0,
 };
 
+// Fallback market ids observed in production funding feed.
+const LIGHTER_MARKET_ID_BY_COIN = {
+  BTC: 1,
+  ETH: 0,
+  SOL: 2,
+  BNB: 25,
+};
+
 function toNum(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -180,11 +188,25 @@ async function fetchWithCache(cacheKey, fn) {
 async function fetchBinanceBook(coin) {
   const symbol = `${coin}USDT`;
   return fetchWithCache(`binance:${symbol}`, async () => {
-    const data = await getJson(`https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=1000`);
-    return {
-      asks: normalizeLevels(data.asks),
-      bids: normalizeLevels(data.bids),
-    };
+    const urls = [
+      `https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=1000`,
+      `https://data-api.binance.vision/api/v3/depth?symbol=${symbol}&limit=1000`,
+      `https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=1000`,
+    ];
+    let lastErr = null;
+    for (const url of urls) {
+      try {
+        const data = await getJson(url);
+        const asks = normalizeLevels(data?.asks);
+        const bids = normalizeLevels(data?.bids);
+        if (asks.length && bids.length) {
+          return { asks, bids };
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw new Error(`Binance book unavailable: ${lastErr instanceof Error ? lastErr.message : 'unknown error'}`);
   });
 }
 
@@ -412,6 +434,47 @@ function mapLighterLevels(levels, priceDecimals, sizeDecimals) {
     .filter((level) => level[0] && level[1] && level[0] > 0 && level[1] > 0);
 }
 
+function splitLighterOrderRows(rows) {
+  if (!Array.isArray(rows)) return { asks: [], bids: [] };
+
+  const asks = [];
+  const bids = [];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const sideRaw = String(row.side ?? row.order_side ?? row.direction ?? row.taker_side ?? '').toUpperCase();
+    const isAskRaw = row.is_ask ?? row.isAsk ?? row.ask ?? row.isSell;
+    const isAsk = typeof isAskRaw === 'boolean' ? isAskRaw : null;
+
+    const side =
+      sideRaw.includes('ASK') || sideRaw.includes('SELL')
+        ? 'ask'
+        : sideRaw.includes('BID') || sideRaw.includes('BUY')
+          ? 'bid'
+          : isAsk === true
+            ? 'ask'
+            : isAsk === false
+              ? 'bid'
+              : null;
+    if (!side) continue;
+
+    const price = row.price ?? row.px ?? row.limit_price ?? row.limitPrice ?? row.quote_price;
+    const size =
+      row.remaining_base_amount ??
+      row.remainingBaseAmount ??
+      row.size ??
+      row.sz ??
+      row.base_amount ??
+      row.baseAmount ??
+      row.quantity ??
+      row.qty;
+
+    const level = [price, size];
+    if (side === 'ask') asks.push(level);
+    else bids.push(level);
+  }
+  return { asks, bids };
+}
+
 function extractLighterOrders(payload) {
   if (!payload || typeof payload !== 'object') {
     return { asks: [], bids: [] };
@@ -427,6 +490,20 @@ function extractLighterOrders(payload) {
   }
   if (payload?.data && (Array.isArray(payload.data.sell_orders) || Array.isArray(payload.data.buy_orders))) {
     return { asks: payload.data.sell_orders ?? [], bids: payload.data.buy_orders ?? [] };
+  }
+  const candidates = [
+    payload?.orders,
+    payload?.data?.orders,
+    payload?.orderBookOrders,
+    payload?.data?.orderBookOrders,
+    payload?.rows,
+    payload?.data?.rows,
+    payload?.data?.data,
+  ];
+  for (const c of candidates) {
+    if (!Array.isArray(c)) continue;
+    const split = splitLighterOrderRows(c);
+    if (split.asks.length || split.bids.length) return split;
   }
   return { asks: [], bids: [] };
 }
@@ -459,12 +536,46 @@ function lighterMarketIndexOf(market) {
   return market?.market_index ?? market?.marketIndex ?? market?.market_id ?? market?.marketId ?? market?.id ?? market?.index;
 }
 
+function lighterMarketDecimalsOf(market) {
+  const p = Number(market?.supported_price_decimals ?? market?.price_decimals ?? market?.priceDecimals ?? 0);
+  const s = Number(market?.supported_size_decimals ?? market?.size_decimals ?? market?.sizeDecimals ?? 0);
+  return {
+    priceDecimals: Number.isFinite(p) && p >= 0 ? p : 0,
+    sizeDecimals: Number.isFinite(s) && s >= 0 ? s : 0,
+  };
+}
+
+async function fetchLighterBookByKnownMarketId(makeUrls, marketId, priceDecimals = 0, sizeDecimals = 0) {
+  const limitValues = ['300', '200', '100', '50', ''];
+  const urls = [];
+  for (const limit of limitValues) {
+    const limitQ = limit ? `&limit=${limit}` : '';
+    urls.push(...makeUrls('orderBookOrders', `market_index=${marketId}${limitQ}`));
+    urls.push(...makeUrls('orderBookOrders', `marketIndex=${marketId}${limitQ}`));
+    urls.push(...makeUrls('orderBookOrders', `market_id=${marketId}${limitQ}`));
+    urls.push(...makeUrls('orderBookOrders', `marketId=${marketId}${limitQ}`));
+    urls.push(...makeUrls('orderBookOrders', `by=market_index&value=${marketId}${limitQ}`));
+    urls.push(...makeUrls('orderBookOrders', `by=market_id&value=${marketId}${limitQ}`));
+    urls.push(...makeUrls('orderBookOrders', `by=index&value=${marketId}${limitQ}`));
+  }
+
+  for (const url of Array.from(new Set(urls))) {
+    try {
+      const payload = await getJson(url);
+      const book = extractLighterBookWithFallbackDecimals(payload, priceDecimals, sizeDecimals);
+      if (book.asks.length && book.bids.length) return book;
+    } catch (_) {}
+  }
+  return null;
+}
+
 async function fetchLighterBook(coin) {
   return fetchWithCache(`lighter:${coin}`, async () => {
     const baseConfigs = [
       { base: 'https://api.lighter.xyz', prefixes: ['/api/v1', '/v1', ''] },
       { base: 'https://lighter.xyz', prefixes: ['/api/v1', '/api', ''] },
       { base: 'https://mainnet.zklighter.elliot.ai', prefixes: ['/api/v1'] },
+      { base: 'https://api.prod.lighter.xyz', prefixes: ['/api/v1', '/v1'] },
     ];
     let lastErr = null;
 
@@ -539,6 +650,13 @@ async function fetchLighterBook(coin) {
         books = Array.from(uniq.values());
 
         const rankedCandidates = rankLighterOrderBooks(books, coin);
+        const knownId = LIGHTER_MARKET_ID_BY_COIN[String(coin).toUpperCase()];
+        if (!rankedCandidates.length && knownId != null) {
+          const fallbackBook = await fetchLighterBookByKnownMarketId(makeUrls, knownId, 0, 0);
+          if (fallbackBook && fallbackBook.asks.length && fallbackBook.bids.length) {
+            return fallbackBook;
+          }
+        }
         if (!rankedCandidates.length) {
           const sample = books
             .slice(0, 12)
@@ -554,8 +672,7 @@ async function fetchLighterBook(coin) {
 
         for (const selected of shortlist) {
           const marketIndex = lighterMarketIndexOf(selected);
-          const priceDecimals = Number(selected.supported_price_decimals ?? selected.price_decimals ?? 0);
-          const sizeDecimals = Number(selected.supported_size_decimals ?? selected.size_decimals ?? 0);
+          const { priceDecimals, sizeDecimals } = lighterMarketDecimalsOf(selected);
           const symbol = String(selected.symbol ?? selected.market_symbol ?? '').toUpperCase();
           selectedDesc = `${symbol || 'unknown'}#${marketIndex ?? 'na'}`;
 
@@ -598,6 +715,14 @@ async function fetchLighterBook(coin) {
             }
           }
         }
+
+        if (knownId != null) {
+          const fallbackBook = await fetchLighterBookByKnownMarketId(makeUrls, knownId, 0, 0);
+          if (fallbackBook && fallbackBook.asks.length && fallbackBook.bids.length) {
+            return fallbackBook;
+          }
+        }
+
         throw new Error(
           `Lighter returned empty asks/bids for ${selectedDesc}${orderErr instanceof Error ? `: ${orderErr.message}` : ''}${
             catalogErr instanceof Error ? ` (catalog: ${catalogErr.message})` : ''
