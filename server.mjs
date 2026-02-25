@@ -238,8 +238,8 @@ function buildSyntheticSimulation({ qty, side, markPrice, bestBid, bestAsk }) {
   const ask = toNum(bestAsk);
 
   let topPrice = null;
-  if (side === 'buy') topPrice = ask ?? mark;
-  else topPrice = bid ?? mark;
+  if (side === 'buy') topPrice = ask ?? mark ?? bid;
+  else topPrice = bid ?? mark ?? ask;
 
   if (!(topPrice > 0)) throw new Error('top price unavailable');
 
@@ -263,6 +263,24 @@ function cacheQtyKey(qty) {
   const n = Number(qty);
   if (!Number.isFinite(n)) return '0';
   return (Math.round(n * 1e6) / 1e6).toString();
+}
+
+function normalizeQuoteForSynthetic(side, mark, bid, ask) {
+  let m = toNum(mark);
+  let b = toNum(bid);
+  let a = toNum(ask);
+
+  if (!(m > 0) && b > 0 && a > 0) {
+    m = (b + a) / 2;
+  }
+  if (!(m > 0) && b > 0) m = b;
+  if (!(m > 0) && a > 0) m = a;
+
+  // Ensure side-specific top exists for buildSyntheticSimulation.
+  if (side === 'buy' && !(a > 0) && m > 0) a = m;
+  if (side === 'sell' && !(b > 0) && m > 0) b = m;
+
+  return { mark: m, bid: b, ask: a };
 }
 
 async function fetchReferenceMark(coin) {
@@ -563,27 +581,33 @@ async function fetch01xyzBook(coin, qty, side) {
 async function fetchNadoBook(coin, qty, side) {
   const base = String(coin || '').toUpperCase();
   return fetchWithCache(`nado:${base}:${side}:${cacheQtyKey(qty)}`, async () => {
-    const symbolsRes = await getJson(`${NADO_GATEWAY}/symbols`);
-    const symbolsList = Array.isArray(symbolsRes)
-      ? symbolsRes
-      : Array.isArray(symbolsRes?.data)
-        ? symbolsRes.data
-        : Object.values(symbolsRes?.data?.symbols || symbolsRes?.symbols || {});
+    let picked = null;
+    let wanted = `${base}-PERP`;
+    let symbolsErr = null;
+    try {
+      const symbolsRes = await getJson(`${NADO_GATEWAY}/symbols`);
+      const symbolsList = Array.isArray(symbolsRes)
+        ? symbolsRes
+        : Array.isArray(symbolsRes?.data)
+          ? symbolsRes.data
+          : Object.values(symbolsRes?.data?.symbols || symbolsRes?.symbols || {});
 
-    if (!Array.isArray(symbolsList) || !symbolsList.length) throw new Error('nado symbols empty');
-
-    const wanted = `${base}-PERP`;
-    const picked =
-      symbolsList.find((it) => String(it?.symbol || it?.symbol_key || it?.symbolKey || '').toUpperCase() === wanted) ||
-      symbolsList.find((it) => {
-        const s = String(it?.symbol || it?.symbol_key || it?.symbolKey || it?.name || '').toUpperCase();
-        return extractBaseSymbol(s) === base && s.includes('PERP');
-      }) ||
-      symbolsList.find((it) => {
-        const s = String(it?.symbol || it?.symbol_key || it?.symbolKey || it?.name || '').toUpperCase();
-        return extractBaseSymbol(s) === base;
-      });
-    if (!picked) throw new Error(`nado symbol not found: ${wanted}`);
+      if (Array.isArray(symbolsList) && symbolsList.length) {
+        picked =
+          symbolsList.find((it) => String(it?.symbol || it?.symbol_key || it?.symbolKey || '').toUpperCase() === wanted) ||
+          symbolsList.find((it) => {
+            const s = String(it?.symbol || it?.symbol_key || it?.symbolKey || it?.name || '').toUpperCase();
+            return extractBaseSymbol(s) === base && s.includes('PERP');
+          }) ||
+          symbolsList.find((it) => {
+            const s = String(it?.symbol || it?.symbol_key || it?.symbolKey || it?.name || '').toUpperCase();
+            return extractBaseSymbol(s) === base;
+          }) ||
+          null;
+      }
+    } catch (e) {
+      symbolsErr = e;
+    }
 
     const productId = toNum(picked?.product_id ?? picked?.productId ?? picked?.id);
     const symbol = String(picked?.symbol || picked?.symbol_key || picked?.symbolKey || wanted);
@@ -608,7 +632,7 @@ async function fetchNadoBook(coin, qty, side) {
       }
     }
 
-    const mark =
+    let mark =
       pickNumDeep(picked, [
         'mark_price', 'markPrice', 'index_price', 'indexPrice', 'last_price', 'lastPrice',
         'price', 'last', 'oracle_price', 'oraclePrice',
@@ -617,18 +641,22 @@ async function fetchNadoBook(coin, qty, side) {
       ]) ??
       (await fetchFundingMarkFallback('nado', base)) ??
       (await fetchReferenceMark(base));
-    const bid =
+    let bid =
       pickNumDeep(picked, [
         'best_bid', 'bestBid', 'bid_price', 'bidPrice', 'bid', 'bbo.bid',
         'stats.best_bid', 'stats.bestBid', 'ticker.best_bid', 'ticker.bestBid',
       ]);
-    const ask =
+    let ask =
       pickNumDeep(picked, [
         'best_ask', 'bestAsk', 'ask_price', 'askPrice', 'ask', 'bbo.ask',
         'stats.best_ask', 'stats.bestAsk', 'ticker.best_ask', 'ticker.bestAsk',
       ]);
-    if (!(mark > 0) && !(bid > 0) && !(ask > 0)) {
-      throw new Error(`nado book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}`);
+    ({ mark, bid, ask } = normalizeQuoteForSynthetic(side, mark, bid, ask));
+
+    const sideTop = side === 'buy' ? ask : bid;
+    if (!(sideTop > 0) && !(mark > 0) && !(bid > 0) && !(ask > 0)) {
+      const hint = symbolsErr instanceof Error ? `, symbols: ${symbolsErr.message}` : '';
+      throw new Error(`nado book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}${hint}`);
     }
     return { kind: 'simulation', simulation: buildSyntheticSimulation({ qty, side, markPrice: mark, bestBid: bid, bestAsk: ask }) };
   });
@@ -657,29 +685,38 @@ async function fetchPacificaBook(coin, qty, side) {
       }
     }
 
-    const prices = await getJson(`${PACIFICA_BASE}/api/v1/info/prices`, { headers: { Accept: 'application/json' } });
-    const items = [
-      ...flattenArrayish(prices),
-      ...flattenArrayish(prices?.data),
-      ...flattenArrayish(prices?.result),
-      ...flattenArrayish(prices?.prices),
-    ];
-    const it = items.find((x) => {
-      const s = String(
-        x?.symbol ?? x?.market ?? x?.pair ?? x?.name ?? x?.coin ?? x?.asset ?? x?.instrument ?? '',
-      );
-      return extractBaseSymbol(s) === base;
-    });
-    const mark =
+    let it = null;
+    try {
+      const prices = await getJson(`${PACIFICA_BASE}/api/v1/info/prices`, { headers: { Accept: 'application/json' } });
+      const items = [
+        ...flattenArrayish(prices),
+        ...flattenArrayish(prices?.data),
+        ...flattenArrayish(prices?.result),
+        ...flattenArrayish(prices?.prices),
+      ];
+      it = items.find((x) => {
+        const s = String(
+          x?.symbol ?? x?.market ?? x?.pair ?? x?.name ?? x?.coin ?? x?.asset ?? x?.instrument ?? '',
+        );
+        return extractBaseSymbol(s) === base;
+      }) || null;
+    } catch (_) {
+      it = null;
+    }
+
+    let mark =
       pickNumDeep(it, [
         'mark', 'mark_price', 'markPrice', 'price', 'last', 'last_price', 'lastPrice',
         'index_price', 'indexPrice', 'oracle_price', 'oraclePrice',
       ]) ??
       (await fetchFundingMarkFallback('pacifica', base)) ??
       (await fetchReferenceMark(base));
-    const bid = pickNumDeep(it, ['best_bid', 'bestBid', 'bid_price', 'bidPrice', 'bid', 'bbo.bid']);
-    const ask = pickNumDeep(it, ['best_ask', 'bestAsk', 'ask_price', 'askPrice', 'ask', 'bbo.ask']);
-    if (!(mark > 0) && !(bid > 0) && !(ask > 0)) {
+    let bid = pickNumDeep(it, ['best_bid', 'bestBid', 'bid_price', 'bidPrice', 'bid', 'bbo.bid']);
+    let ask = pickNumDeep(it, ['best_ask', 'bestAsk', 'ask_price', 'askPrice', 'ask', 'bbo.ask']);
+    ({ mark, bid, ask } = normalizeQuoteForSynthetic(side, mark, bid, ask));
+
+    const sideTop = side === 'buy' ? ask : bid;
+    if (!(sideTop > 0) && !(mark > 0) && !(bid > 0) && !(ask > 0)) {
       throw new Error(`pacifica book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}`);
     }
     return { kind: 'simulation', simulation: buildSyntheticSimulation({ qty, side, markPrice: mark, bestBid: bid, bestAsk: ask }) };
