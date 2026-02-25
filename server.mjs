@@ -13,6 +13,7 @@ const PACIFICA_BASE = process.env.PACIFICA_BASE_URL || 'https://api.pacifica.fi'
 const PARADEX_BASE = process.env.PARADEX_BASE_URL || 'https://api.prod.paradex.trade';
 const EXTENDED_BASE = process.env.EXTENDED_BASE_URL || 'https://api.starknet.extended.exchange';
 const EXTENDED_FALLBACK_BASES = ['https://api.extended.exchange'];
+const FUNDING_API_URL = process.env.FUNDING_API_URL || 'https://fundingrate-auto.vercel.app/api/funding-8h';
 
 const cache = new Map();
 
@@ -136,6 +137,71 @@ function pickFrom(obj, keys = []) {
   return null;
 }
 
+function deepGet(obj, path) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  const parts = String(path || '').split('.');
+  let cur = obj;
+  for (const part of parts) {
+    if (cur == null || typeof cur !== 'object') return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+function pickNumDeep(obj, paths = []) {
+  for (const path of paths) {
+    const n = toNum(deepGet(obj, path));
+    if (n != null) return n;
+  }
+  return null;
+}
+
+function flattenArrayish(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+  const arr = [];
+  for (const v of Object.values(payload)) {
+    if (Array.isArray(v)) arr.push(...v);
+    else if (v && typeof v === 'object') arr.push(v);
+  }
+  return arr;
+}
+
+function buildFallbackBookFromMark(mark) {
+  const p = toNum(mark);
+  if (!(p > 0)) return null;
+  return {
+    asks: [[p, 1e9]],
+    bids: [[p, 1e9]],
+  };
+}
+
+async function fetchFundingSnapshotRows() {
+  return fetchWithCache('funding:snapshot', async () => {
+    const payload = await getJson(FUNDING_API_URL, { headers: { Accept: 'application/json' } });
+    const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+    return rows;
+  });
+}
+
+async function fetchFundingMarkFallback(exchange, coin) {
+  const ex = String(exchange || '').toLowerCase();
+  const sym = String(coin || '').toUpperCase();
+  if (!ex || !sym) return null;
+
+  try {
+    const rows = await fetchFundingSnapshotRows();
+    const row = rows.find((r) => {
+      const rex = String(r?.exchange || '').toLowerCase();
+      const rsym = String(r?.symbol || '').toUpperCase();
+      return rex === ex && rsym === sym;
+    });
+    return toNum(row?.mark_price ?? row?.markPrice);
+  } catch (_) {
+    return null;
+  }
+}
+
 function extractBookFromPayload(payload) {
   const roots = [
     payload,
@@ -218,6 +284,21 @@ async function fetchReferenceMark(coin) {
     try {
       const t = await getJson(`https://api.exchange.coinbase.com/products/${sym}-USD/ticker`);
       const p = toNum(t?.price ?? t?.last);
+      if (p && p > 0) return p;
+    } catch (_) {}
+
+    // 3) Binance futures mark
+    try {
+      const t = await getJson(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${sym}USDT`);
+      const p = toNum(t?.markPrice ?? t?.indexPrice ?? t?.lastFundingRate);
+      if (p && p > 0) return p;
+    } catch (_) {}
+
+    // 4) OKX ticker
+    try {
+      const t = await getJson(`https://www.okx.com/api/v5/market/ticker?instId=${sym}-USDT`);
+      const row = Array.isArray(t?.data) ? t.data[0] : null;
+      const p = toNum(row?.last ?? row?.markPx ?? row?.idxPx);
       if (p && p > 0) return p;
     } catch (_) {}
 
@@ -492,11 +573,20 @@ async function fetchNadoBook(coin, qty, side) {
     if (!Array.isArray(symbolsList) || !symbolsList.length) throw new Error('nado symbols empty');
 
     const wanted = `${base}-PERP`;
-    const picked = symbolsList.find((it) => String(it?.symbol || '').toUpperCase() === wanted);
+    const picked =
+      symbolsList.find((it) => String(it?.symbol || it?.symbol_key || it?.symbolKey || '').toUpperCase() === wanted) ||
+      symbolsList.find((it) => {
+        const s = String(it?.symbol || it?.symbol_key || it?.symbolKey || it?.name || '').toUpperCase();
+        return extractBaseSymbol(s) === base && s.includes('PERP');
+      }) ||
+      symbolsList.find((it) => {
+        const s = String(it?.symbol || it?.symbol_key || it?.symbolKey || it?.name || '').toUpperCase();
+        return extractBaseSymbol(s) === base;
+      });
     if (!picked) throw new Error(`nado symbol not found: ${wanted}`);
 
-    const productId = toNum(picked?.product_id ?? picked?.productId);
-    const symbol = wanted;
+    const productId = toNum(picked?.product_id ?? picked?.productId ?? picked?.id);
+    const symbol = String(picked?.symbol || picked?.symbol_key || picked?.symbolKey || wanted);
 
     const bookUrls = [
       `${NADO_GATEWAY}/orderbook?symbol=${encodeURIComponent(symbol)}`,
@@ -519,15 +609,24 @@ async function fetchNadoBook(coin, qty, side) {
     }
 
     const mark =
-      toNum(picked?.mark_price) ??
-      toNum(picked?.markPrice) ??
-      toNum(picked?.index_price) ??
-      toNum(picked?.indexPrice) ??
-      toNum(picked?.last_price) ??
-      toNum(picked?.lastPrice) ??
-      await fetchReferenceMark(base);
-    const bid = toNum(picked?.best_bid) ?? toNum(picked?.bestBid) ?? toNum(picked?.bid_price) ?? toNum(picked?.bidPrice);
-    const ask = toNum(picked?.best_ask) ?? toNum(picked?.bestAsk) ?? toNum(picked?.ask_price) ?? toNum(picked?.askPrice);
+      pickNumDeep(picked, [
+        'mark_price', 'markPrice', 'index_price', 'indexPrice', 'last_price', 'lastPrice',
+        'price', 'last', 'oracle_price', 'oraclePrice',
+        'stats.mark_price', 'stats.markPrice', 'stats.last_price', 'stats.lastPrice',
+        'ticker.mark_price', 'ticker.markPrice', 'ticker.last_price', 'ticker.lastPrice',
+      ]) ??
+      (await fetchFundingMarkFallback('nado', base)) ??
+      (await fetchReferenceMark(base));
+    const bid =
+      pickNumDeep(picked, [
+        'best_bid', 'bestBid', 'bid_price', 'bidPrice', 'bid', 'bbo.bid',
+        'stats.best_bid', 'stats.bestBid', 'ticker.best_bid', 'ticker.bestBid',
+      ]);
+    const ask =
+      pickNumDeep(picked, [
+        'best_ask', 'bestAsk', 'ask_price', 'askPrice', 'ask', 'bbo.ask',
+        'stats.best_ask', 'stats.bestAsk', 'ticker.best_ask', 'ticker.bestAsk',
+      ]);
     if (!(mark > 0) && !(bid > 0) && !(ask > 0)) {
       throw new Error(`nado book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}`);
     }
@@ -559,11 +658,27 @@ async function fetchPacificaBook(coin, qty, side) {
     }
 
     const prices = await getJson(`${PACIFICA_BASE}/api/v1/info/prices`, { headers: { Accept: 'application/json' } });
-    const items = Array.isArray(prices) ? prices : Array.isArray(prices?.data) ? prices.data : [];
-    const it = items.find((x) => extractBaseSymbol(x?.symbol) === base);
-    const mark = toNum(it?.mark) ?? toNum(it?.mark_price) ?? await fetchReferenceMark(base);
-    const bid = toNum(it?.best_bid) ?? toNum(it?.bestBid) ?? toNum(it?.bid_price) ?? toNum(it?.bidPrice);
-    const ask = toNum(it?.best_ask) ?? toNum(it?.bestAsk) ?? toNum(it?.ask_price) ?? toNum(it?.askPrice);
+    const items = [
+      ...flattenArrayish(prices),
+      ...flattenArrayish(prices?.data),
+      ...flattenArrayish(prices?.result),
+      ...flattenArrayish(prices?.prices),
+    ];
+    const it = items.find((x) => {
+      const s = String(
+        x?.symbol ?? x?.market ?? x?.pair ?? x?.name ?? x?.coin ?? x?.asset ?? x?.instrument ?? '',
+      );
+      return extractBaseSymbol(s) === base;
+    });
+    const mark =
+      pickNumDeep(it, [
+        'mark', 'mark_price', 'markPrice', 'price', 'last', 'last_price', 'lastPrice',
+        'index_price', 'indexPrice', 'oracle_price', 'oraclePrice',
+      ]) ??
+      (await fetchFundingMarkFallback('pacifica', base)) ??
+      (await fetchReferenceMark(base));
+    const bid = pickNumDeep(it, ['best_bid', 'bestBid', 'bid_price', 'bidPrice', 'bid', 'bbo.bid']);
+    const ask = pickNumDeep(it, ['best_ask', 'bestAsk', 'ask_price', 'askPrice', 'ask', 'bbo.ask']);
     if (!(mark > 0) && !(bid > 0) && !(ask > 0)) {
       throw new Error(`pacifica book unavailable: ${lastErr instanceof Error ? lastErr.message : 'no market price'}`);
     }
@@ -1135,6 +1250,11 @@ async function fetchLighterBook(coin) {
       }
     }
 
+    const fallbackMark = (await fetchFundingMarkFallback('lighter', coin)) ?? (await fetchReferenceMark(coin));
+    const fallbackBook = buildFallbackBookFromMark(fallbackMark);
+    if (fallbackBook) {
+      return fallbackBook;
+    }
     const msg = lastErr instanceof Error ? lastErr.message : 'Unknown Lighter API error';
     throw new Error(`Unable to load Lighter book: ${msg}`);
   });
