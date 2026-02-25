@@ -1395,22 +1395,32 @@ async function fetchVariationalBook(coin, qty, side) {
   const isQuoteStale = quoteAgeSec > 60;
   const notional = qty * markPrice;
   const quoteSide = side === 'buy' ? 'ask' : 'bid';
+  const topFromQuotes = pickVariationalTopPrice(listing?.quotes, quoteSide);
   let usedSpreadFallback = false;
-  let quotePrice = pickVariationalQuotePrice(listing?.quotes, notional, quoteSide);
-  if (!quotePrice || isQuoteStale) {
+  let usedStaleTopFallback = false;
+  let quotePrice = !isQuoteStale ? pickVariationalQuotePrice(listing?.quotes, notional, quoteSide) : null;
+  if (!quotePrice) {
+    quotePrice = pickVariationalQuotePrice(listing?.quotes, notional, quoteSide);
+  }
+
+  if (isQuoteStale) {
     const spreadBps = toNum(listing?.base_spread_bps);
     const spreadBasedPrice = estimateFromBaseSpread(markPrice, spreadBps, side);
     if (spreadBasedPrice) {
       quotePrice = spreadBasedPrice;
       usedSpreadFallback = true;
+    } else if (topFromQuotes && topFromQuotes > 0) {
+      // stale quote interpolation can overshoot for small tickets; stick to top bucket when fresh spread is unavailable.
+      quotePrice = topFromQuotes;
+      usedStaleTopFallback = true;
     }
   }
   if (!quotePrice || quotePrice <= 0) {
     throw new Error(`Variational quote unavailable for ${coin}`);
   }
 
-  let topPrice = pickVariationalTopPrice(listing?.quotes, quoteSide) ?? quotePrice;
-  if (usedSpreadFallback) {
+  let topPrice = topFromQuotes ?? quotePrice;
+  if (usedSpreadFallback || usedStaleTopFallback) {
     // If we already switched to spread fallback, do not derive slippage from stale quote buckets.
     topPrice = quotePrice;
   }
@@ -1439,6 +1449,8 @@ async function fetchVariationalBook(coin, qty, side) {
       priceReference: 'mark',
       quoteAgeSec,
       quoteStaleFallback: isQuoteStale,
+      quoteStaleTopFallback: usedStaleTopFallback,
+      quoteSpreadFallback: usedSpreadFallback,
     },
   };
 }
