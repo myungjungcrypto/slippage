@@ -14,6 +14,13 @@ const PARADEX_BASE = process.env.PARADEX_BASE_URL || 'https://api.prod.paradex.t
 const EXTENDED_BASE = process.env.EXTENDED_BASE_URL || 'https://api.starknet.extended.exchange';
 const EXTENDED_FALLBACK_BASES = ['https://api.extended.exchange'];
 const FUNDING_API_URL = process.env.FUNDING_API_URL || 'https://fundingrate-auto.vercel.app/api/funding-8h';
+const PARADEX_FEE_PROFILE = String(process.env.PARADEX_FEE_PROFILE || 'retail').trim().toLowerCase();
+const PARADEX_TAKER_FEE_BPS = (() => {
+  const explicit = Number(process.env.PARADEX_TAKER_FEE_BPS);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  // Paradex docs: retail perp taker fee is 0%, pro is 0.02% (=2 bps).
+  return PARADEX_FEE_PROFILE === 'pro' ? 2 : 0;
+})();
 
 const cache = new Map();
 
@@ -81,7 +88,7 @@ const TAKER_FEE_BPS = {
   '01xyz': 5,
   nado: 5,
   pacifica: 5,
-  paradex: 5,
+  paradex: PARADEX_TAKER_FEE_BPS,
   extended: 5,
 };
 
